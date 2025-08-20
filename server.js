@@ -248,3 +248,50 @@ app.get("/", (_req, res) => res.send("Spotify GPT Bridge is running ✅"));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Server on :${PORT}`));
+// Add a track to a playlist by searching for it
+app.post("/addTrack", async (req, res) => {
+  if (!req.session.access_token) {
+    return res.status(401).send("Not logged in.");
+  }
+
+  const { trackName, artistName, playlistId } = req.body;
+
+  try {
+    // 1. Search for track
+    const searchRes = await axios.get("https://api.spotify.com/v1/search", {
+      headers: {
+        Authorization: `Bearer ${req.session.access_token}`,
+      },
+      params: {
+        q: `track:${trackName} artist:${artistName}`,
+        type: "track",
+        limit: 1,
+      },
+    });
+
+    if (!searchRes.data.tracks.items.length) {
+      return res.status(404).send("Track not found.");
+    }
+
+    const trackUri = searchRes.data.tracks.items[0].uri;
+
+    // 2. Add to playlist
+    await axios.post(
+      `https://api.spotify.com/v1/playlists/${playlistId}/tracks`,
+      { uris: [trackUri] },
+      {
+        headers: {
+          Authorization: `Bearer ${req.session.access_token}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    res.send(`Added ${trackName} by ${artistName} to playlist!`);
+  } catch (error) {
+    console.error(error.response?.data || error.message);
+    res.status(500).send("Error adding track to playlist.");
+  }
+});
+
+

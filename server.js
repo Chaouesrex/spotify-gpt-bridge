@@ -21,7 +21,7 @@ const CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
 const REDIRECT_URI = process.env.SPOTIFY_REDIRECT_URI;
 const ACTION_SHARED_SECRET = process.env.ACTION_SHARED_SECRET || "";
 
-// Optional session (kept, but GPT auth uses shared secret)
+// Optional session (you can keep, but GPT auth will use the shared secret)
 app.use(
   session({
     secret: process.env.SESSION_SECRET || "defaultsecret",
@@ -106,7 +106,7 @@ app.get("/callback", async (req, res) => {
 
     ACCESS_TOKEN = r.data.access_token;
     ACCESS_EXPIRES_AT = Date.now() + (r.data.expires_in || 3600) * 1000;
-    if (r.data.refresh_token) REFRESH_TOKEN = r.data.refresh_token; // keep old one if missing
+    if (r.data.refresh_token) REFRESH_TOKEN = r.data.refresh_token;
 
     res.send("✅ Connected! You can close this tab.");
   } catch (e) {
@@ -116,52 +116,27 @@ app.get("/callback", async (req, res) => {
 });
 
 // ---------- Helpers ----------
-async function getUserId() {
-  const r = await sp("get", "/me");
-  if (r.status >= 300) throw new Error("Failed to get user profile");
-  return r.data.id;
+async function ensureActiveDevice() {
+  const status = await sp("get", "/me/player");
+  if (status.status === 200 && status.data?.device?.id) return status.data.device.id;
+
+  const devs = await sp("get", "/me/player/devices");
+  const first = devs.data?.devices?.[0];
+  if (!first) throw new Error("No available devices. Open Spotify and play a song briefly.");
+
+  await sp("put", "/me/player", { data: { device_ids: [first.id], play: false } });
+  return first.id;
 }
 
-async function findPlaylistIdByName(name) {
-  const userId = await getUserId();
-  let offset = 0;
-  while (true) {
-    const r = await sp("get", `/users/${userId}/playlists`, { params: { limit: 50, offset } });
-    if (r.status >= 300) throw new Error("Failed to list playlists");
-    const hit = r.data.items.find((p) => p.name.toLowerCase() === name.toLowerCase());
-    if (hit) return hit.id;
-    if (r.data.items.length < 50) return null;
-    offset += 50;
-  }
-}
-
-async function createPlaylist(name, description = "Created by GPT Bridge", isPublic = false) {
-  const userId = await getUserId();
-  const r = await sp("post", `/users/${userId}/playlists`, {
-    data: { name, description, public: isPublic },
-  });
-  if (r.status >= 300) throw new Error("Failed to create playlist");
-  return r.data.id;
-}
-
-function buildTrackQuery({ query, trackName, artistName }) {
-  if (query && query.trim()) return query.trim();
-  let parts = [];
-  if (trackName) parts.push(`track:${trackName}`);
-  if (artistName) parts.push(`artist:${artistName}`);
-  return parts.join(" ").trim();
-}
-
-async function searchTopTrackUri(q) {
-  const r = await sp("get", "/search", { params: { q, type: "track", limit: 1 } });
-  const item = r.data?.tracks?.items?.[0];
-  return item?.uri || null;
-}
-
-// ---------- Playback ----------
+// ---------- Playback controls ----------
 app.post("/play", guard, async (_req, res) => {
-  const r = await sp("put", "/me/player/play");
-  return r.status < 300 ? res.json({ ok: true }) : res.status(r.status).json(r.data);
+  try {
+    await ensureActiveDevice();
+    const r = await sp("put", "/me/player/play");
+    return r.status < 300 ? res.json({ ok: true }) : res.status(r.status).json(r.data);
+  } catch (e) {
+    return res.status(409).json({ error: e.message });
+  }
 });
 
 app.post("/pause", guard, async (_req, res) => {
@@ -185,12 +160,30 @@ app.get("/status", guard, async (_req, res) => {
 });
 
 app.post("/volume", guard, async (req, res) => {
-  const v = Math.max(0, Math.min(100, Number(req.body?.volume ?? 50)));
-  const r = await sp("put", `/me/player/volume`, { params: { volume_percent: v } });
+  try {
+    await ensureActiveDevice();
+    const v = Math.max(0, Math.min(100, Number(req.body?.volume ?? 50)));
+    const r = await sp("put", `/me/player/volume`, { params: { volume_percent: v } });
+    return r.status < 300 ? res.json({ ok: true }) : res.status(r.status).json(r.data);
+  } catch (e) {
+    return res.status(409).json({ error: e.message });
+  }
+});
+
+// ---------- Devices ----------
+app.get("/devices", guard, async (_req, res) => {
+  const r = await sp("get", "/me/player/devices");
+  return res.status(r.status).json(r.data);
+});
+
+app.post("/transfer", guard, async (req, res) => {
+  const deviceId = req.body?.deviceId;
+  if (!deviceId) return res.status(400).json({ error: "deviceId is required" });
+  const r = await sp("put", "/me/player", { data: { device_ids: [deviceId], play: false } });
   return r.status < 300 ? res.json({ ok: true }) : res.status(r.status).json(r.data);
 });
 
-// ---------- Search ----------
+// ---------- Search + Playlists ----------
 app.get("/search", guard, async (req, res) => {
   const q = req.query.q;
   if (!q) return res.status(400).json({ error: "Missing query param 'q'." });
@@ -207,79 +200,10 @@ app.get("/search", guard, async (req, res) => {
   });
 });
 
-// Convenience: play top match from a query
-app.post("/playByQuery", guard, async (req, res) => {
-  const q = buildTrackQuery(req.body || {});
-  if (!q) return res.status(400).json({ error: "Provide 'query' or 'trackName'/'artistName'." });
-  const uri = await searchTopTrackUri(q);
-  if (!uri) return res.status(404).json({ error: "Track not found." });
-  const r = await sp("put", "/me/player/play", { data: { uris: [uri] } });
-  return r.status < 300 ? res.json({ ok: true, played: uri }) : res.status(r.status).json(r.data);
-});
+// … (keep your playlist create/add endpoints, OpenAPI route, and addTrack handler here) …
 
-// ---------- Playlists ----------
-app.post("/playlist", guard, async (req, res) => {
-  const name = (req.body?.name || "").trim();
-  if (!name) return res.status(400).json({ error: "name is required" });
-  try {
-    const id = await createPlaylist(name, req.body?.description, !!req.body?.public);
-    res.json({ ok: true, playlistId: id });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Add a song to a playlist (by name OR by id)
-// Body supports:
-// { playlistName?: string, playlistId?: string, query?: string, trackName?: string, artistName?: string, uri?: string, createIfMissing?: boolean }
-app.post("/playlist/add", guard, async (req, res) => {
-  try {
-    const {
-      playlistName,
-      playlistId: incomingId,
-      query,
-      trackName,
-      artistName,
-      uri,
-      createIfMissing = true,
-    } = req.body || {};
-
-    // resolve track URI
-    let trackUri = uri;
-    if (!trackUri) {
-      const q = buildTrackQuery({ query, trackName, artistName });
-      if (!q) return res.status(400).json({ error: "Provide 'uri' or a search query/track+artist." });
-      trackUri = await searchTopTrackUri(q);
-      if (!trackUri) return res.status(404).json({ error: "Track not found" });
-    }
-
-    // resolve playlist
-    let playlistId = incomingId || null;
-    if (!playlistId && playlistName) {
-      playlistId = await findPlaylistIdByName(playlistName);
-      if (!playlistId && createIfMissing) {
-        playlistId = await createPlaylist(playlistName);
-      }
-    }
-    if (!playlistId) return res.status(400).json({ error: "Provide 'playlistId' or 'playlistName'." });
-
-    // add track
-    const r = await sp("post", `/playlists/${playlistId}/tracks`, { data: { uris: [trackUri] } });
-    if (r.status >= 300) return res.status(r.status).json(r.data);
-
-    res.json({ ok: true, playlistId, added: trackUri });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Serve OpenAPI spec (so your Custom GPT can import it)
-app.get("/openapi.yaml", (_req, res) => {
-  res.sendFile(path.join(__dirname, "openapi.yaml"));
-});
-
+// ---------- Startup ----------
 app.get("/", (_req, res) => res.send("Spotify GPT Bridge is running ✅"));
 
-// IMPORTANT: listen AFTER all routes are defined
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Server on :${PORT}`));

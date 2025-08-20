@@ -1,11 +1,17 @@
-const express = require("express");
-const session = require("express-session");
-const axios = require("axios");
-const dotenv = require("dotenv");
+import express from "express";
+import session from "express-session";
+import axios from "axios";
+import dotenv from "dotenv";
+import path from "path";
+import { fileURLToPath } from "url";
 
 dotenv.config();
 
 const app = express();
+
+// Needed for __dirname in ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 app.use(express.json());
 
@@ -18,7 +24,7 @@ app.use(
   })
 );
 
-// Spotify auth endpoints
+// Spotify auth values
 const clientId = process.env.SPOTIFY_CLIENT_ID;
 const clientSecret = process.env.SPOTIFY_CLIENT_SECRET;
 const redirectUri = process.env.SPOTIFY_REDIRECT_URI;
@@ -58,15 +64,15 @@ app.get("/callback", async (req, res) => {
     req.session.access_token = response.data.access_token;
     req.session.refresh_token = response.data.refresh_token;
 
-    res.send("Login successful! You can now use the GPT bridge.");
+    res.send("✅ Login successful! You can now use the GPT bridge.");
   } catch (error) {
     console.error(error.response?.data || error.message);
-    res.status(500).send("Error authenticating with Spotify");
+    res.status(500).send("❌ Error authenticating with Spotify");
   }
 });
 
-// Example: Play/pause route
-app.post("/playpause", async (req, res) => {
+// Example: Play route
+app.post("/play", async (req, res) => {
   if (!req.session.access_token) {
     return res.status(401).send("Not logged in.");
   }
@@ -80,15 +86,42 @@ app.post("/playpause", async (req, res) => {
       },
     });
 
-    res.send("Playback started/paused!");
+    res.send("▶️ Playback started!");
   } catch (error) {
     console.error(error.response?.data || error.message);
-    res.status(500).send("Failed to control playback.");
+    res.status(500).send("❌ Failed to start playback.");
   }
+});
+
+// Example: Pause route
+app.post("/pause", async (req, res) => {
+  if (!req.session.access_token) {
+    return res.status(401).send("Not logged in.");
+  }
+
+  try {
+    await axios({
+      method: "put",
+      url: "https://api.spotify.com/v1/me/player/pause",
+      headers: {
+        Authorization: `Bearer ${req.session.access_token}`,
+      },
+    });
+
+    res.send("⏸️ Playback paused!");
+  } catch (error) {
+    console.error(error.response?.data || error.message);
+    res.status(500).send("❌ Failed to pause playback.");
+  }
+});
+
+// Serve OpenAPI spec
+app.get("/openapi.yaml", (req, res) => {
+  res.sendFile(path.join(__dirname, "openapi.yaml"));
 });
 
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });

@@ -21,7 +21,7 @@ const CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
 const REDIRECT_URI = process.env.SPOTIFY_REDIRECT_URI;
 const ACTION_SHARED_SECRET = process.env.ACTION_SHARED_SECRET || "";
 
-// Optional session (you can keep, but GPT auth will use the shared secret)
+// Optional session (kept, but GPT auth uses shared secret)
 app.use(
   session({
     secret: process.env.SESSION_SECRET || "defaultsecret",
@@ -106,8 +106,7 @@ app.get("/callback", async (req, res) => {
 
     ACCESS_TOKEN = r.data.access_token;
     ACCESS_EXPIRES_AT = Date.now() + (r.data.expires_in || 3600) * 1000;
-    // sometimes Spotify omits refresh_token if already granted; keep existing if missing
-    if (r.data.refresh_token) REFRESH_TOKEN = r.data.refresh_token;
+    if (r.data.refresh_token) REFRESH_TOKEN = r.data.refresh_token; // keep old one if missing
 
     res.send("✅ Connected! You can close this tab.");
   } catch (e) {
@@ -116,7 +115,50 @@ app.get("/callback", async (req, res) => {
   }
 });
 
-// ---------- Playback controls (for GPT) ----------
+// ---------- Helpers ----------
+async function getUserId() {
+  const r = await sp("get", "/me");
+  if (r.status >= 300) throw new Error("Failed to get user profile");
+  return r.data.id;
+}
+
+async function findPlaylistIdByName(name) {
+  const userId = await getUserId();
+  let offset = 0;
+  while (true) {
+    const r = await sp("get", `/users/${userId}/playlists`, { params: { limit: 50, offset } });
+    if (r.status >= 300) throw new Error("Failed to list playlists");
+    const hit = r.data.items.find((p) => p.name.toLowerCase() === name.toLowerCase());
+    if (hit) return hit.id;
+    if (r.data.items.length < 50) return null;
+    offset += 50;
+  }
+}
+
+async function createPlaylist(name, description = "Created by GPT Bridge", isPublic = false) {
+  const userId = await getUserId();
+  const r = await sp("post", `/users/${userId}/playlists`, {
+    data: { name, description, public: isPublic },
+  });
+  if (r.status >= 300) throw new Error("Failed to create playlist");
+  return r.data.id;
+}
+
+function buildTrackQuery({ query, trackName, artistName }) {
+  if (query && query.trim()) return query.trim();
+  let parts = [];
+  if (trackName) parts.push(`track:${trackName}`);
+  if (artistName) parts.push(`artist:${artistName}`);
+  return parts.join(" ").trim();
+}
+
+async function searchTopTrackUri(q) {
+  const r = await sp("get", "/search", { params: { q, type: "track", limit: 1 } });
+  const item = r.data?.tracks?.items?.[0];
+  return item?.uri || null;
+}
+
+// ---------- Playback ----------
 app.post("/play", guard, async (_req, res) => {
   const r = await sp("put", "/me/player/play");
   return r.status < 300 ? res.json({ ok: true }) : res.status(r.status).json(r.data);
@@ -148,7 +190,7 @@ app.post("/volume", guard, async (req, res) => {
   return r.status < 300 ? res.json({ ok: true }) : res.status(r.status).json(r.data);
 });
 
-// ---------- Search + Playlists ----------
+// ---------- Search ----------
 app.get("/search", guard, async (req, res) => {
   const q = req.query.q;
   if (!q) return res.status(400).json({ error: "Missing query param 'q'." });
@@ -165,35 +207,17 @@ app.get("/search", guard, async (req, res) => {
   });
 });
 
-async function getUserId() {
-  const r = await sp("get", "/me");
-  if (r.status >= 300) throw new Error("Failed to get user profile");
-  return r.data.id;
-}
+// Convenience: play top match from a query
+app.post("/playByQuery", guard, async (req, res) => {
+  const q = buildTrackQuery(req.body || {});
+  if (!q) return res.status(400).json({ error: "Provide 'query' or 'trackName'/'artistName'." });
+  const uri = await searchTopTrackUri(q);
+  if (!uri) return res.status(404).json({ error: "Track not found." });
+  const r = await sp("put", "/me/player/play", { data: { uris: [uri] } });
+  return r.status < 300 ? res.json({ ok: true, played: uri }) : res.status(r.status).json(r.data);
+});
 
-async function findPlaylistIdByName(name) {
-  const userId = await getUserId();
-  let offset = 0;
-  while (true) {
-    const r = await sp("get", `/users/${userId}/playlists`, { params: { limit: 50, offset } });
-    if (r.status >= 300) throw new Error("Failed to list playlists");
-    const hit = r.data.items.find((p) => p.name.toLowerCase() === name.toLowerCase());
-    if (hit) return hit.id;
-    if (r.data.items.length < 50) return null;
-    offset += 50;
-  }
-}
-
-async function createPlaylist(name, description = "Created by GPT Bridge", isPublic = false) {
-  const userId = await getUserId();
-  const r = await sp("post", `/users/${userId}/playlists`, {
-    data: { name, description, public: isPublic },
-  });
-  if (r.status >= 300) throw new Error("Failed to create playlist");
-  return r.data.id;
-}
-
-// Create a playlist explicitly
+// ---------- Playlists ----------
 app.post("/playlist", guard, async (req, res) => {
   const name = (req.body?.name || "").trim();
   if (!name) return res.status(400).json({ error: "name is required" });
@@ -205,29 +229,39 @@ app.post("/playlist", guard, async (req, res) => {
   }
 });
 
-// Add a song to a playlist by name; creates playlist if missing
-// Body: { playlistName: string, query?: string, uri?: string, createIfMissing?: boolean }
+// Add a song to a playlist (by name OR by id)
+// Body supports:
+// { playlistName?: string, playlistId?: string, query?: string, trackName?: string, artistName?: string, uri?: string, createIfMissing?: boolean }
 app.post("/playlist/add", guard, async (req, res) => {
-  const { playlistName, query, uri, createIfMissing = true } = req.body || {};
-  if (!playlistName) return res.status(400).json({ error: "playlistName is required" });
-
   try {
+    const {
+      playlistName,
+      playlistId: incomingId,
+      query,
+      trackName,
+      artistName,
+      uri,
+      createIfMissing = true,
+    } = req.body || {};
+
     // resolve track URI
     let trackUri = uri;
-    if (!trackUri && query) {
-      const sr = await sp("get", "/search", { params: { q: query, type: "track", limit: 1 } });
-      const item = sr.data?.tracks?.items?.[0];
-      if (!item) return res.status(404).json({ error: "Track not found" });
-      trackUri = item.uri;
+    if (!trackUri) {
+      const q = buildTrackQuery({ query, trackName, artistName });
+      if (!q) return res.status(400).json({ error: "Provide 'uri' or a search query/track+artist." });
+      trackUri = await searchTopTrackUri(q);
+      if (!trackUri) return res.status(404).json({ error: "Track not found" });
     }
-    if (!trackUri) return res.status(400).json({ error: "Provide 'uri' or 'query'." });
 
-    // find or create playlist
-    let playlistId = await findPlaylistIdByName(playlistName);
-    if (!playlistId && createIfMissing) {
-      playlistId = await createPlaylist(playlistName);
+    // resolve playlist
+    let playlistId = incomingId || null;
+    if (!playlistId && playlistName) {
+      playlistId = await findPlaylistIdByName(playlistName);
+      if (!playlistId && createIfMissing) {
+        playlistId = await createPlaylist(playlistName);
+      }
     }
-    if (!playlistId) return res.status(404).json({ error: "Playlist not found" });
+    if (!playlistId) return res.status(400).json({ error: "Provide 'playlistId' or 'playlistName'." });
 
     // add track
     const r = await sp("post", `/playlists/${playlistId}/tracks`, { data: { uris: [trackUri] } });
@@ -246,52 +280,6 @@ app.get("/openapi.yaml", (_req, res) => {
 
 app.get("/", (_req, res) => res.send("Spotify GPT Bridge is running ✅"));
 
+// IMPORTANT: listen AFTER all routes are defined
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Server on :${PORT}`));
-// Add a track to a playlist by searching for it
-app.post("/addTrack", async (req, res) => {
-  if (!req.session.access_token) {
-    return res.status(401).send("Not logged in.");
-  }
-
-  const { trackName, artistName, playlistId } = req.body;
-
-  try {
-    // 1. Search for track
-    const searchRes = await axios.get("https://api.spotify.com/v1/search", {
-      headers: {
-        Authorization: `Bearer ${req.session.access_token}`,
-      },
-      params: {
-        q: `track:${trackName} artist:${artistName}`,
-        type: "track",
-        limit: 1,
-      },
-    });
-
-    if (!searchRes.data.tracks.items.length) {
-      return res.status(404).send("Track not found.");
-    }
-
-    const trackUri = searchRes.data.tracks.items[0].uri;
-
-    // 2. Add to playlist
-    await axios.post(
-      `https://api.spotify.com/v1/playlists/${playlistId}/tracks`,
-      { uris: [trackUri] },
-      {
-        headers: {
-          Authorization: `Bearer ${req.session.access_token}`,
-          "Content-Type": "application/json",
-        },
-      }
-    );
-
-    res.send(`Added ${trackName} by ${artistName} to playlist!`);
-  } catch (error) {
-    console.error(error.response?.data || error.message);
-    res.status(500).send("Error adding track to playlist.");
-  }
-});
-
-
